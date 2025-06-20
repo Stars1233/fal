@@ -33,6 +33,8 @@ import uvicorn
 import yaml
 from fastapi import FastAPI
 from fastapi import __version__ as fastapi_version
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from pydantic import __version__ as pydantic_version
@@ -165,18 +167,6 @@ class Host(Generic[ArgsT, ReturnT]):
             options.add_requirements(SERVE_REQUIREMENTS)
 
         return options
-
-    def register(
-        self,
-        func: Callable[ArgsT, ReturnT],
-        options: Options,
-        application_name: str | None = None,
-        application_auth_mode: Literal["public", "shared", "private"] | None = None,
-        metadata: dict[str, Any] | None = None,
-        scale: bool = True,
-    ) -> str | None:
-        """Register the given function on the host for API call execution."""
-        raise NotImplementedError
 
     def run(
         self,
@@ -415,6 +405,7 @@ class FalServerlessHost(Host):
             "metadata",
             "request_timeout",
             "startup_timeout",
+            "private_logs",
             "_base_image",
             "_scheduler",
             "_scheduler_options",
@@ -512,6 +503,8 @@ class FalServerlessHost(Host):
             metadata=metadata,
             deployment_strategy=deployment_strategy,
             scale=scale,
+            # By default, logs are public
+            private_logs=options.host.get("private_logs", False),
         ):
             for log in partial_result.logs:
                 self._log_printer.print(log)
@@ -622,8 +615,8 @@ class FalServerlessHost(Host):
         def result_handler(partial_result):
             ret.stream = partial_result.stream
             for log in partial_result.logs:
-                if "Access your exposed service at" in log.message:
-                    ret.url = log.message.rsplit()[-1]
+                if "And API access through" in log.message:
+                    ret.url = log.message.rsplit()[-1].replace("queue.", "")
                 ret.logs.put(log)
 
         self._thread_pool.submit(
@@ -963,7 +956,18 @@ def function(  # type: ignore
     def wrapper(func: Callable[ArgsT, ReturnT]):
         include_modules_from(func)
 
-        for module_name in local_python_modules or []:
+        if local_python_modules and not isinstance(local_python_modules, list):
+            raise ValueError(
+                "local_python_modules must be a list of module names as strings, got "
+                f"{repr(local_python_modules)}"
+            )
+
+        for idx, module_name in enumerate(local_python_modules or []):
+            if not isinstance(module_name, str):
+                raise ValueError(
+                    "local_python_modules must be a list of module names as strings, "
+                    f"got {repr(module_name)} at index {idx}"
+                )
             include_module(module_name)
 
         proxy = IsolatedFunction(
@@ -1100,6 +1104,17 @@ class BaseServable:
         @_app.exception_handler(FieldException)
         async def field_exception_handler(request: Request, exc: FieldException):
             return JSONResponse(exc.to_pydantic_format(), exc.status_code)
+
+        # ref: https://github.com/fastapi/fastapi/blob/37c8e7d76b4b47eb2c4cced6b4de59eb3d5f08eb/fastapi/exception_handlers.py#L20
+        @_app.exception_handler(RequestValidationError)
+        async def request_val_exception_handler(
+            request: Request, exc: RequestValidationError
+        ):
+            return JSONResponse(
+                {"detail": jsonable_encoder(exc.errors())},
+                422,
+                headers={"x-fal-billable-units": "0"},
+            )
 
         @_app.exception_handler(CUDAOutOfMemoryException)
         async def cuda_out_of_memory_exception_handler(

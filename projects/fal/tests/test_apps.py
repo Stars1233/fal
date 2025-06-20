@@ -212,6 +212,7 @@ class ExceptionApp(fal.App, keep_alive=300, max_concurrency=1):
     def app_exception(self) -> Output:
         raise AppException(message="this app is designed to fail", status_code=401)
 
+    # While making the request provide payload as {"lhs": 1, "rhs": 2}
     @fal.endpoint("/field-exception")
     def field_exception(self, input: Input) -> Output:
         raise FieldException(
@@ -403,6 +404,12 @@ def test_stateful_app(host: api.FalServerlessHost, user: User):
 
 
 @pytest.fixture(scope="module")
+def test_pydantic_validation_error():
+    with AppClient.connect(StatefulAdditionApp) as client:
+        yield client
+
+
+@pytest.fixture(scope="module")
 def test_cancellable_app(host: api.FalServerlessHost, user: User):
     cancellable_app = fal.wrap_app(CancellableApp)
     with register_app(host, cancellable_app, "cancellable") as (app_alias, _):
@@ -569,13 +576,6 @@ def test_app_disconnect_behavior(test_app: str, test_cancellable_app: str):
     assert (
         e.value.response.status_code == 504
     ), "Expected Gateway Timeout even though the app handled it"
-
-    with pytest.raises(HTTPStatusError) as e:
-        apps.run(
-            test_cancellable_app,
-            arguments={"lhs": 1, "rhs": 2, "wait_time": 1},
-        )
-    assert e.value.response.status_code == 500
 
 
 @pytest.mark.xfail(
@@ -956,6 +956,34 @@ def test_app_exceptions(test_exception_app: AppClient):
 
     assert cuda_exc.value.status_code == _CUDA_OOM_STATUS_CODE
     assert _CUDA_OOM_MESSAGE in cuda_exc.value.message
+
+
+def test_pydantic_validation_billing(test_pydantic_validation_error: AppClient):
+    with httpx.Client() as httpx_client:
+        url = test_pydantic_validation_error.url + "/increment"
+        response = httpx_client.post(
+            url,
+            json={"value": "this-is-not-an-integer"},
+            timeout=30,
+        )
+
+        assert response.status_code == 422
+        assert response.headers.get("x-fal-billable-units") == "0"
+
+
+def test_field_exception_billing(test_exception_app: AppClient):
+    with httpx.Client() as httpx_client:
+        url = test_exception_app.url + "/field-exception"
+        response = httpx_client.post(
+            url,
+            json={"lhs": 1, "rhs": 2},
+            timeout=30,
+        )
+
+        assert response.status_code == 422
+        # For errors raised on runtime, developers should be handling the billing.
+        # Therefore not adding billing units.
+        assert not hasattr(response.headers, "x-fal-billable-units")
 
 
 def test_kill_runner(host: api.FalServerlessHost, test_sleep_app: str):

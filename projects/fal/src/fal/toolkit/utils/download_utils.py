@@ -427,13 +427,22 @@ def clone_repository(
     if repo_name is None:
         repo_name = Path(https_url).stem
         if commit_hash:
+            if len(commit_hash) < 8:
+                raise ValueError(f"Commit hash '{commit_hash}' is too short.")
             repo_name += f"-{commit_hash[:8]}"
 
     local_repo_path = Path(target_dir) / repo_name  # type: ignore[arg-type]
 
     if local_repo_path.exists():
-        local_repo_commit_hash = _get_git_revision_hash(local_repo_path)
-        if local_repo_commit_hash == commit_hash and not force:
+        local_repo_commit_hash = _git_rev_parse(local_repo_path, "HEAD")
+        full_commit_hash = (
+            _git_rev_parse(local_repo_path, commit_hash) if commit_hash else None
+        )
+        if (
+            full_commit_hash
+            and local_repo_commit_hash == full_commit_hash
+            and not force
+        ):
             if include_to_path:
                 __add_local_path_to_sys_path(local_repo_path)
             return local_repo_path
@@ -456,7 +465,7 @@ def clone_repository(
                     # repository might be already deleted by another worker
                     os.rename(local_repo_path, tmp_dir)
                     # sometimes seeing FileNotFoundError even here on juicefs
-                    shutil.rmtree(tmp_dir)
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # NOTE: using the target_dir to be able to avoid potential copies across temp fs
     # and target fs, and also to be able to atomically rename repo_name dir into place
@@ -482,13 +491,17 @@ def clone_repository(
             if commit_hash:
                 checkout_command = ["git", "checkout", commit_hash]
                 subprocess.check_call(checkout_command, cwd=temp_dir)
+                subprocess.check_call(
+                    ["git", "submodule", "update", "--init", "--recursive"],
+                    cwd=temp_dir,
+                )
 
             # NOTE: Atomically renaming the repository directory into place when the
             # clone and checkout are done.
             try:
                 os.rename(temp_dir, local_repo_path)
             except OSError as error:
-                shutil.rmtree(temp_dir)
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
                 # someone beat us to it, assume it's good
                 if error.errno != errno.ENOTEMPTY:
@@ -512,12 +525,12 @@ def __add_local_path_to_sys_path(local_path: Path | str):
         sys.path.insert(0, local_path_str)
 
 
-def _get_git_revision_hash(repo_path: Path) -> str:
+def _git_rev_parse(repo_path: Path, ref: str) -> str:
     import subprocess
 
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "rev-parse", ref],
             cwd=repo_path,
             text=True,
             stderr=subprocess.STDOUT,
